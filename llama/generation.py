@@ -107,19 +107,21 @@ class Llama:
         checkpoint = torch.load(ckpt_path, map_location="cpu")
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
-
+        # 模型参数
         model_args: ModelArgs = ModelArgs(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             **params,
         )
+        # 加载 tokenizer
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model_args.vocab_size = tokenizer.n_words
         torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        # 加载模型
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
-
+        # 返回 Llama 实例
         return Llama(model, tokenizer)
 
     def __init__(self, model: Transformer, tokenizer: Tokenizer):
@@ -155,28 +157,31 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
-        params = self.model.params
-        bsz = len(prompt_tokens)
+
+        params = self.model.params #模型参数
+        # batch size
+        bsz = len(prompt_tokens) # 提示token的组数
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
-        min_prompt_len = min(len(t) for t in prompt_tokens)
-        max_prompt_len = max(len(t) for t in prompt_tokens)
+        min_prompt_len = min(len(t) for t in prompt_tokens) # 提示句子中最短的提示长度
+        max_prompt_len = max(len(t) for t in prompt_tokens) # 提示句子中最长的提示长度
         assert max_prompt_len <= params.max_seq_len
-        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
+        total_len = min(params.max_seq_len, max_gen_len + max_prompt_len) #最终要生成字总长度
 
-        pad_id = self.tokenizer.pad_id
+        pad_id = self.tokenizer.pad_id #填充字
+        # 生成一个shape 为(提示token的组数,total_len) 初始字符为pad_id的tokens
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda") # 挨个取出prompt中的每个句子 放到tokens中
         if logprobs:
-            token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
+            token_logprobs = torch.zeros_like(tokens, dtype=torch.float) # 定义一个跟tokens尺寸一致的概率token_logprobs
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
-        input_text_mask = tokens != pad_id
+        eos_reached = torch.tensor([False] * bsz, device="cuda") # 用于判断prompt中的每个句子是否已经处理完成
+        input_text_mask = tokens != pad_id  #mask 标记那些不是填充字的地方
         if min_prompt_len == total_len:
-            logits = self.model.forward(tokens, prev_pos)
-            token_logprobs = -F.cross_entropy(
+            logits = self.model.forward(tokens, prev_pos)  # 以prompt中的每个句子作为输入去推理
+            token_logprobs = -F.cross_entropy( # 计算交叉熵
                 input=logits.transpose(1, 2),
                 target=tokens,
                 reduction="none",
@@ -184,12 +189,12 @@ class Llama:
             )
 
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos) # 以每个句子中的[prev_pos:cur_pos]部分作为输入去推理
             if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1) #带温度系数的softmax
+                next_token = sample_top_p(probs, top_p) #按sample_top_p的方式取next_token
             else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)
+                next_token = torch.argmax(logits[:, -1], dim=-1) #之间取概率最大的next_token
 
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
@@ -197,20 +202,23 @@ class Llama:
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
             tokens[:, cur_pos] = next_token
-            if logprobs:
+            if logprobs:  # 如果开启了计算概率，就会把当前输出的序列logits，与原始提示中的序列右移一位之后的序列进行交叉熵计算
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
                     target=tokens[:, prev_pos + 1 : cur_pos + 1],
                     reduction="none",
-                    ignore_index=pad_id,
+                    ignore_index=pad_id, #这里需要注意一下，ignore_index参数的作用是忽略target中为pad_id所对应的logits分量
+                                        #也就说当target右移到了pad_id，那么他与logits计算的loss不对整体loss产生影响，也就是你预测的是啥就是啥
+                                        #target也不知道正确答案了，所以不计算loss
                 )
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 next_token == self.tokenizer.eos_id
-            )
+            ) # 如果当前位置是eos_id，那么就把eos_reached对应位置置为True
             prev_pos = cur_pos
             if all(eos_reached):
                 break
-
+        
+        # 返回生成的tokens和对应的概率
         if logprobs:
             token_logprobs = token_logprobs.tolist()
         out_tokens, out_logprobs = [], []
@@ -239,6 +247,7 @@ class Llama:
         logprobs: bool = False,
         echo: bool = False,
     ) -> List[CompletionPrediction]:
+        # 生成文本补全
         """
         Perform text completion for a list of prompts using the language generation model.
 
@@ -259,9 +268,12 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
+        # 如果max_gen_len没有指定，那么就设置为模型的最大序列长度减1
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
+        # 提示token
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        # 生成文本
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
@@ -270,7 +282,9 @@ class Llama:
             logprobs=logprobs,
             echo=echo,
         )
+        # 返回生成的文本
         if logprobs:
+            # 返回生成的文本，对应的token概率
             return [
                 {
                     "generation": self.tokenizer.decode(t),
@@ -279,6 +293,7 @@ class Llama:
                 }
                 for t, logprobs_i in zip(generation_tokens, generation_logprobs)
             ]
+        # 
         return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
 
     def chat_completion(
@@ -411,11 +426,13 @@ def sample_top_p(probs, p):
         exceeds the threshold p. The distribution is renormalized based on the selected tokens.
 
     """
-    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    mask = probs_sum - probs_sort > p
-    probs_sort[mask] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    next_token = torch.multinomial(probs_sort, num_samples=1)
-    next_token = torch.gather(probs_idx, -1, next_token)
-    return next_token
+    # 从给定的概率分布中采样一个token，采样的方式是先对概率进行排序，然后计算累积概率，
+    #然后选择累积概率小于p的部分，最后在这部分中随机选择一个token。
+    probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True) # 对概率进行排序
+    probs_sum = torch.cumsum(probs_sort, dim=-1) # 计算累积概率
+    mask = probs_sum - probs_sort > p # 选择累积概率小于p的部分
+    probs_sort[mask] = 0.0 # 将累积概率小于p的部分置为0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True)) # 重新归一化
+    next_token = torch.multinomial(probs_sort, num_samples=1) # 从重新归一化的概率分布中采样一个token
+    next_token = torch.gather(probs_idx, -1, next_token) # 从原始概率分布中取出对应的token
+    return next_token # 返回采样的token
